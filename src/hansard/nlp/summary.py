@@ -9,13 +9,12 @@ from openai.types.responses import ParsedResponse, ResponseTextConfigParam
 from pydantic import BaseModel, Field
 
 from hansard.entities.speech import Speech
+from hansard.entities.talker import TalkerList
 from hansard.nlp.enums import SpeechTone
 from hansard.repositories.speech_stats_repository import (
     AbstractSpeechStatsRepository,
     SpeechStats,
 )
-from hansard.repositories.talker_repository import AbstractTalkerRepository
-from utils.background_tasks import BackgroundTasks
 from utils.events.local import LocalPublisher
 
 logger = logging.getLogger(__name__)
@@ -36,16 +35,17 @@ class SpeechSummaryResult(BaseModel):
 OPENAI_MODEL = "gpt-5-mini-2025-08-07"
 ENCODER = tiktoken.encoding_for_model(OPENAI_MODEL)
 MIN_TOKENS_FOR_SUMMARISATION = 150
-MAX_TOKENS_BEFORE_TRUNCATION = 10000
+MAX_TOKENS_BEFORE_TRUNCATION = 5000
 BATCH_FILE_PATH = "openai_batch_file.jsonl"
 BATCH_FINALISED_STATES = {"completed", "failed", "expired", "cancelled"}
 BATCH_MAX_POLL_TIME_SECONDS = 86400  # 24 hours
+CLIENT = AsyncOpenAI()
 
 OPENAI_SYSTEM_PROMPT = """
 You are an expert parliamentary analyst. The user will provide you with an entire, or partial transcript of a parliamentary speech that discusses a specific bill.
 It could be a new bill, an amendment to an existing bill, a repeal of an existing bill, or a motion related to a bill.
 
-The title signifies which bill is being discussed. 
+The title signifies which bill is being discussed.
 
 Your job will be to analyse the speech and provide some distilled information about it.
 Pay particular attention to:
@@ -82,7 +82,7 @@ def openai_create_responses_batch_input(
         toks = toks[:MAX_TOKENS_BEFORE_TRUNCATION]
         speech_content = ENCODER.decode(toks)
         logger.error(
-            f"[speech:{speech_id}] too long for summarisation ({toks_len} tokens), truncating to 10000 tokens."  # noqa
+            f"[speech:{speech_id}] too long for summarisation ({toks_len} tokens), truncating to {MAX_TOKENS_BEFORE_TRUNCATION} tokens."  # noqa
         )
     return {
         "custom_id": str(speech_id),
@@ -103,10 +103,12 @@ def openai_create_responses_batch_input(
     }
 
 
-def openai_create_batch_file(speeches: list[tuple[str, str]]):
+def openai_create_batch_file(speeches: list[Speech], talkerlist: TalkerList):
     entries: list[dict[str, Any]] = []
-    for speech_id, speech_content in speeches:
-        input = openai_create_responses_batch_input(speech_id, speech_content)
+    for speech in speeches:
+        input = openai_create_responses_batch_input(
+            speech.id, speech.to_string(talkerlist)
+        )
         if input:
             entries.append(input)
     # save as .jsonl file
@@ -139,6 +141,7 @@ async def openai_save_batch_results(
     output_results = await client.files.content(
         file_id=batch_results.output_file_id
     )
+    speech_ids = set[str]()
     for res in output_results.text.split("\n"):
         if res == "":
             continue
@@ -160,7 +163,9 @@ async def openai_save_batch_results(
             tone=summary_result.tone,
         )
         await speech_stats_repo.upsert_speech_stats(speech_stats)
+        speech_ids.add(speech_id)
         logger.info(f"[speech:{speech_id}] upserted speech stats")
+    return speech_ids
 
 
 async def openai_poll_batch_results(
@@ -172,14 +177,19 @@ async def openai_poll_batch_results(
 ):
     poll_start_time = asyncio.get_event_loop().time()
     while True:
+        logger.info(f"[batch:{batch_id}] polling for results...")
         batch_res = await client.batches.retrieve(batch_id=batch_id)
         if batch_res.status == "completed":
             logger.info(f"[batch:{batch_id}] completed.")
-            await openai_save_batch_results(
+            speech_ids = await openai_save_batch_results(
                 batch_id, speech_stats_repo, client
             )
             publisher.publish(
-                {"topic": "nlp.batch_completed", "batch_id": batch_id}
+                {
+                    "topic": "nlp.batch_completed",
+                    "batch_id": batch_id,
+                    "speech_ids": list(speech_ids),
+                }
             )
             break
         elif batch_res.status in BATCH_FINALISED_STATES or (
@@ -199,28 +209,3 @@ async def openai_poll_batch_results(
                 {"topic": "nlp.batch_polling", "batch_id": batch_id}
             )
             await asyncio.sleep(poll_interval_seconds)
-
-
-async def summarise_speeches(
-    speeches: list[Speech],
-    talker_repository: AbstractTalkerRepository,
-    speech_stats_repo: AbstractSpeechStatsRepository,
-    publisher: LocalPublisher,
-    background_tasks: BackgroundTasks,
-    client: AsyncOpenAI,
-):
-    talkerlist = await talker_repository.list_talkers()
-    speech_entries = [
-        (speech.id, speech.to_string(talkerlist))
-        for speech in speeches
-        if speech.id
-    ]
-    openai_create_batch_file(speech_entries)
-    batch_res = await openai_upload_batch_file(client)
-    background_tasks.add(
-        openai_poll_batch_results,
-        batch_res.id,
-        speech_stats_repo,
-        publisher,
-        client,
-    )

@@ -7,6 +7,14 @@ P = ParamSpec("P")
 
 
 class BackgroundTasks(abc.ABC):
+    _instance: "BackgroundTasks | None" = None
+
+    @staticmethod
+    def get() -> "BackgroundTasks":
+        if BackgroundTasks._instance is None:
+            BackgroundTasks._instance = BackgroundTasks()
+        return BackgroundTasks._instance
+
     def __init__(self, tasks: set[asyncio.Task[Any]] | None = None):
         self._tasks: set[asyncio.Task[Any]] = (
             tasks if tasks is not None else set()

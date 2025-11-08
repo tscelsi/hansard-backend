@@ -1,27 +1,24 @@
-import asyncio
 import logging
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Sequence, TypedDict
+from typing import Any, Sequence, TypedDict
 
 import httpx
 from bs4 import BeautifulSoup, ResultSet, Tag
-from pymongo import AsyncMongoClient
 from pymongo.asynchronous.collection import AsyncCollection
+from pymongo.asynchronous.database import AsyncDatabase
 
 from hansard.downloader import Downloader, create_driver
 from hansard.entities.speech import HouseType
-from hansard.nlp_subscribers import DivisivenessSubscriber
 from hansard.parser import Parser
-from hansard.repositories.part_repository import (
-    AbstractPartRepository,
-    MongoPartRepository,
+from hansard.repositories.part_repository import AbstractPartRepository
+from hansard.repositories.talker_repository import AbstractTalkerRepository
+from hansard.views.bill_overview import (
+    FinalBillOverviewResult,
+    call_db,
+    fill_missing_dates,
+    get_party_speech_proportions,
 )
-from hansard.repositories.talker_repository import (
-    AbstractTalkerRepository,
-    MongoTalkerRepository,
-)
-from paths import DATA_DIR
 from utils.events.local import LocalPublisher
 
 logger = logging.getLogger(__name__)
@@ -159,41 +156,43 @@ async def parse_many(
     publisher.publish(
         {
             "topic": "parser.completed",
-            "speech_ids": speech_ids,
+            "speech_ids": list(speech_ids),
             "house": house.value,
         }
     )
 
 
+async def refresh_bill_overview(
+    bill_id: str, db: AsyncDatabase[Any]
+) -> FinalBillOverviewResult | None:
+    res = await call_db(bill_id, db)
+    if res is None:
+        logger.error(f"[bill:{bill_id}] error creating bill overview")
+        return None
+    party_speech_proportions = get_party_speech_proportions(
+        res.get("partyCounts", [])
+    )
+    over_time = fill_missing_dates(res.get("overTime", []))
+    await db["bill_overview"].update_one(
+        {"bill_id": bill_id},
+        {
+            "$set": {
+                "partySpeechProportions": party_speech_proportions,
+                "speechesOverTime": over_time,
+                "topSpeakers": res.get("topSpeakers", []),
+                "speechList": res.get("speechList", []),
+                "sentiment": res.get("sentiment", []),
+                "updatedAt": datetime.now(tz=timezone.utc),
+            }
+        },
+        upsert=True,
+    )
+
+
 async def main():
-    logging.basicConfig(level=logging.DEBUG)
-    modules = ["pymongo", "urllib3", "httpx", "selenium"]
-    for module in modules:
-        logging.getLogger(module).setLevel("ERROR")
-    publisher = LocalPublisher()
-    mongo_client = AsyncMongoClient[LatestParsedType](
-        "mongodb://localhost:27017"
-    )
-    speech_part_repo = MongoPartRepository(mongo_client, "tmp")
-    # speech_stats_repo = MongoSpeechStatsRepository(mongo_client, "local")
-    talker_repo = MongoTalkerRepository(mongo_client, "tmp")
-    # client = AsyncOpenAI()
-    # summariser_event_listener = SummariserSubscriber(
-    #     talker_repository=talker_repo,
-    #     speech_part_repo=speech_part_repo,
-    #     speech_stats_repo=speech_stats_repo,
-    #     publisher=publisher,
-    #     client=client,
-    #     background_tasks=None,
-    # )
-    divisiveness_event_listener = DivisivenessSubscriber(
-        talker_repository=talker_repo,
-        speech_part_repo=speech_part_repo,
-        publisher=publisher,
-    )
-    # await summariser_event_listener.subscribe(["parser.completed"])
-    await divisiveness_event_listener.subscribe(["parser.completed"])
-    house = HouseType.SENATE
+    logging_setup()
+    await db_and_event_setup()
+    house = HouseType.HOR
     # all hor sessions
     new_session_files = sorted(
         (DATA_DIR / "hansard" / house.value).glob("hansard-*.xml")
@@ -201,28 +200,8 @@ async def main():
     await parse_many(
         house,
         new_session_files,
-        speech_part_repo,
-        talker_repo,
-        publisher,
+        DbManager.get().speech_part_repo,
+        DbManager.get().talker_repo,
+        EventManager.get().publisher,
     )
     await asyncio.sleep(100)  # wait for event processing
-
-
-async def run():
-    mongo_client = AsyncMongoClient[LatestParsedType](
-        "mongodb://localhost:27017"
-    )
-    speech_part_repo = MongoPartRepository(mongo_client, "tmp")
-    talker_repo = MongoTalkerRepository(mongo_client, "tmp")
-
-    await parse_one(
-        HouseType.HOR,
-        DATA_DIR / "hansard" / "hor" / "hansard-2025-11-03.xml",
-        speech_part_repo,
-        talker_repo,
-        publisher=None,
-    )
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

@@ -21,7 +21,7 @@ class AbstractSubscriber(abc.ABC):
         )
 
     def __repr__(self):
-        return f"sub-{self._id}[{__class__.__name__}]"
+        return f"sub-{self._id}[{type(self).__name__}]"
 
     def _listening_task_done_callback(self, task: asyncio.Task[None]) -> None:
         """Callback for when the listening task is done.

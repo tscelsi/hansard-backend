@@ -60,12 +60,8 @@ class MongoSpeechStatsRepository(AbstractSpeechStatsRepository):
 
     async def upsert_speech_stats(self, stats: SpeechStats) -> None:
         await self.collection.update_one(
-            {"id": str(stats.id)},
-            {
-                "$set": stats.model_dump(
-                    exclude={"id"}, exclude_none=True, mode="json"
-                )
-            },
+            {"speech_id": str(stats.speech_id)},
+            {"$set": stats.model_dump(exclude_none=True, mode="json")},
             upsert=True,
         )
 
