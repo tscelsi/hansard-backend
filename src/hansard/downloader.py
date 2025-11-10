@@ -28,6 +28,13 @@ def create_driver(headless: bool = False) -> WebDriver:
 
 
 class Downloader:
+    """Taken loosely from:
+
+    Sherratt, Tim. (2019, November 17).
+    GLAM-Workbench/australian-commonwealth-hansard (Version v0.1.0).
+    Zenodo. http://doi.org/10.5281/zenodo.3544706
+    """
+
     def __init__(self, driver: WebDriver) -> None:
         self.driver = driver
 
